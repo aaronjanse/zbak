@@ -325,7 +325,7 @@ fn main() {
 
             let snapshots = origin.list_snapshots();
             if let Some(last) = snapshots.last() {
-                if now.sub(last.time) >= chrono::Duration::minutes(15) {
+                if now.sub(last.time) > chrono::Duration::minutes(14) {
                     let now_tag = now.format("%Y-%m-%dT%H%M");
                     let path = format!("{}@{}", origin.dataset, now_tag);
                     println!("Creating snapshot {}.", path);
