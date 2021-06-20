@@ -4,10 +4,15 @@
   outputs = { self, nixpkgs }: {
     defaultPackage.x86_64-linux = self.packages.x86_64-linux.zbak;
     packages.x86_64-linux.zbak = nixpkgs.legacyPackages.x86_64-linux.callPackage (
-      { rustPlatform }:
+      { lib, makeWrapper, openssh, rustPlatform, zfs }:
       rustPlatform.buildRustPackage rec {
         name = "zbak";
         src = ./.;
+        nativeBuildInputs = [ makeWrapper ];
+        fixupPhase = ''
+          wrapProgram $out/bin/zbak \
+            --set PATH ${lib.makeBinPath [ zfs openssh ]}
+        '';
         cargoSha256 = "sha256-OgRGWOZin8d/HTbxzJ7vxpTmQHhfs5RlJwhcJPaiMB0=";
       }
     ) { };
