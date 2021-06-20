@@ -69,7 +69,7 @@ impl Remote {
             Transport::Local => std::process::Command::new("zfs"),
             Transport::SSH(host) => {
                 let mut tmp = std::process::Command::new("ssh");
-                tmp.arg(host);
+                tmp.args(&["-o", "ConnectTimeout=20", host]);
                 tmp.arg("zfs");
                 tmp
             }
