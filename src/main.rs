@@ -63,6 +63,11 @@ struct Snapshot {
     time: chrono::DateTime<Utc>,
 }
 
+fn is_normal_snapshot(path: &str) -> bool {
+    let re = regex::Regex::new(r"^[a-z/]+@\d{4}-\d{2}-\d{2}T\d{4}$").unwrap();
+    re.is_match(path)
+}
+
 impl Remote {
     fn cmd(&self, args: &[&str]) -> Command {
         let mut cmd = match &self.transport {
@@ -78,18 +83,17 @@ impl Remote {
         cmd
     }
 
-    fn exec(&self, args: &[&str]) -> Option<String> {
+    fn exec(&self, args: &[&str]) -> Result<String, String> {
         let out = self.cmd(args).output().unwrap();
         if out.status.success() {
-            Some(String::from_utf8(out.stdout).unwrap())
+            Ok(String::from_utf8(out.stdout).unwrap())
         } else {
-            println!("err: {:?}", out);
-            None
+            Err(String::from_utf8(out.stderr).unwrap())
         }
     }
 
-    fn internal_list_snapshots(&self) -> Option<Vec<Snapshot>> {
-        let out = self.exec(&[
+    fn internal_list_snapshots(&self) -> Vec<Snapshot> {
+        let out = match self.exec(&[
             "list",
             "-t",
             "snapshot",
@@ -97,41 +101,43 @@ impl Remote {
             "name,creation",
             "-Hp",
             &self.dataset,
-        ])?;
+        ]) {
+            Ok(x) => x,
+            Err(e) => {
+                if e.contains("does not exist") {
+                    "".to_string()
+                } else {
+                    panic!("cmd err: {}", e);
+                }
+            }
+        };
 
-        Some(
-            out.lines()
-                .map(|line| {
-                    let parts = line.split('\t').collect::<Vec<_>>();
-                    Snapshot {
-                        path: parts[0].to_string(),
-                        time: chrono::Utc.timestamp(parts[1].parse::<i64>().unwrap(), 0),
-                    }
-                })
-                .collect(),
-        )
+        out.lines()
+            .map(|line| {
+                let parts = line.split('\t').collect::<Vec<_>>();
+                Snapshot {
+                    path: parts[0].to_string(),
+                    time: chrono::Utc.timestamp(parts[1].parse::<i64>().unwrap(), 0),
+                }
+            })
+            .collect()
     }
 
     fn list_snapshots(&self) -> Vec<Snapshot> {
-        let re = regex::Regex::new(r"^[a-z/]+@\d{4}-\d{2}-\d{2}T\d{4}$").unwrap();
         self.internal_list_snapshots()
-            .unwrap()
             .into_iter()
-            .filter(|snap| re.is_match(&snap.path))
+            .filter(|snap| is_normal_snapshot(&snap.path))
             .collect()
     }
 
     fn list_markers(&self, name: &str) -> Vec<Snapshot> {
         let re = regex::Regex::new(r"^[a-z/]+@repl-").unwrap();
-        match self.internal_list_snapshots() {
-            Some(snaps) => snaps
-                .into_iter()
-                .filter(|snap| {
-                    re.is_match(&snap.path) && snap.path.contains(&format!("@repl-{}", name))
-                })
-                .collect(),
-            None => vec![],
-        }
+        self.internal_list_snapshots()
+            .into_iter()
+            .filter(|snap| {
+                re.is_match(&snap.path) && snap.path.contains(&format!("@repl-{}", name))
+            })
+            .collect()
     }
 
     fn snapshot(&self, path: &str) {
@@ -241,10 +247,10 @@ fn find_prunable(
 }
 
 fn setup_replication(origin: &Remote, destination: &Remote, path: &str) {
-    println!("Initial replication...");
-
     println!("Creating marker {}.", path);
     origin.snapshot(&path);
+
+    println!("Sending...");
 
     let mut producer = origin
         .cmd(&["send", "-w", &path])
@@ -350,125 +356,125 @@ fn main() {
 
             let now = chrono::Utc::now();
             let now_tag = now.format("%Y-%m-%dT%H%M%S");
-            let path = format!("{}@repl-{}-{}", origin.dataset, cmd.name, now_tag);
-
-            let markers_to_tags = |markers: &[Snapshot]| {
-                markers
-                    .iter()
-                    .map(|snap| snap.path.split('@').nth(1).unwrap().to_string())
-                    .collect::<HashSet<_>>()
-            };
+            let now_path = format!("{}@repl-{}-{}", origin.dataset, cmd.name, now_tag);
 
             let mut origin_markers = origin.list_markers(&cmd.name);
-            let origin_tags = markers_to_tags(&origin_markers);
+            origin_markers.sort_by(|a, b| a.time.cmp(&b.time));
 
-            let destination_markers = destination.list_markers(&cmd.name);
-            let destination_tags = markers_to_tags(&destination_markers);
-
-            let common_tags = origin_tags.intersection(&destination_tags);
-
-            origin_markers.sort_by(|a, b| b.time.cmp(&a.time)); // recent, ..., old
-
-            let mut common_marker = None;
-            'search: for marker in &origin_markers {
-                for tag in common_tags.clone() {
-                    if marker.path.contains(tag) {
-                        common_marker = Some(marker);
-                        break 'search;
-                    }
+            let marker = match origin_markers.first() {
+                Some(x) => x,
+                None => {
+                    setup_replication(&origin, &destination, &now_path);
+                    return;
                 }
+            };
+
+            let mut snapshots_to_send = {
+                let mut candidates = vec![marker.clone()];
+                let mut new_origin_snapshots = origin
+                    .list_snapshots()
+                    .into_iter()
+                    .filter(|x| x.time > marker.time)
+                    .collect::<Vec<_>>();
+                candidates.append(&mut new_origin_snapshots);
+                find_prunable(&now, &destination_spec, candidates)
+                    .keep
+                    .into_iter()
+                    .filter(|x| is_normal_snapshot(&x.path))
+                    .collect::<Vec<_>>()
+            };
+
+            snapshots_to_send.sort_by(|a, b| a.time.cmp(&b.time));
+
+            if snapshots_to_send.is_empty() {
+                println!("Nothing to send.");
+                return;
             }
 
-            if let Some(common) = common_marker {
-                println!("Starting at {}.", common.path);
+            let dest_markers = destination.list_markers(&cmd.name);
+            let dest_marker_tags = dest_markers
+                .iter()
+                .map(|snap| snap.path.split('@').nth(1).unwrap().to_string())
+                .collect::<HashSet<_>>();
+            let marker_tag = marker.path.split('@').nth(1).unwrap();
+            if !dest_marker_tags.contains(marker_tag) {
+                println!("Destination missing marker.");
+                setup_replication(&origin, &destination, &now_path);
+                return;
+            }
 
-                let origin_snapshots = origin.list_snapshots();
-                let mut destination_snapshots = destination.list_snapshots();
+            let dest_snapshots = destination.list_snapshots();
+            for snapshot in dest_snapshots.iter().filter(|x| x.time > marker.time) {
+                println!("Destroying destination's {}.", snapshot.path);
+                destination.destroy_snapshot(&snapshot.path);
+            }
 
-                let new_origin_snaps = origin_snapshots
-                    .iter()
-                    .cloned()
-                    .filter(|snap| snap.time > common.time)
-                    .collect::<Vec<_>>();
+            println!("Creating marker {}.", now_path);
+            origin.snapshot(&now_path);
 
-                let mut all_known_snapshots = vec![];
-                all_known_snapshots.append(&mut new_origin_snaps.clone());
-                all_known_snapshots.append(&mut destination_snapshots);
+            let mut send_paths = snapshots_to_send
+                .into_iter()
+                .map(|x| x.path)
+                .collect::<Vec<_>>();
+            send_paths.push(now_path);
 
-                let plan = find_prunable(&now, &destination_spec, all_known_snapshots);
-                let keep_paths = plan.keep.iter().map(|x| x.path.clone()).collect::<Vec<_>>();
-                let mut snapshots_to_send = new_origin_snaps
-                    .into_iter()
-                    .filter(|snap| keep_paths.contains(&snap.path))
-                    .collect::<Vec<_>>();
+            println!("Sending:");
+            for path in &send_paths {
+                println!("- {}", path);
+            }
 
-                if snapshots_to_send.is_empty() {
-                    println!("Nothing to send.");
+            let destination_markers = destination.list_markers(&cmd.name);
+
+            let mut prev = marker.path.clone();
+            for path in send_paths {
+                println!("Sending {} -> {}.", prev, path);
+
+                let mut producer = origin
+                    .cmd(&["send", "-wI", &prev, &path])
+                    .stdout(Stdio::piped())
+                    .spawn()
+                    .unwrap();
+
+                let consumer = destination
+                    .cmd(&["recv", "-u", &destination.dataset])
+                    .stdin(producer.stdout.take().unwrap())
+                    .spawn()
+                    .unwrap();
+
+                let out_consumer = consumer.wait_with_output().unwrap();
+                if !out_consumer.status.success() {
+                    println!("Error: {:?}", out_consumer);
                     return;
                 }
 
-                println!("Creating marker {}.", path);
-                origin.snapshot(&path);
-
-                snapshots_to_send.sort_by(|a, b| a.time.cmp(&b.time));
-
-                let mut send_paths = snapshots_to_send
-                    .into_iter()
-                    .map(|x| x.path)
-                    .collect::<Vec<_>>();
-                send_paths.push(path);
-
-                println!("Sending:");
-                for path in &send_paths {
-                    println!("- {}", path);
+                let out_producer = producer.wait_with_output().unwrap();
+                if !out_producer.status.success() {
+                    println!("Error: {:?}", out_producer);
+                    return;
                 }
 
-                let mut prev = common.path.clone();
-                for path in send_paths {
-                    println!("Sending {} -> {}.", prev, path);
-
-                    let mut producer = origin
-                        .cmd(&["send", "-wI", &prev, &path])
-                        .stdout(Stdio::piped())
-                        .spawn()
-                        .unwrap();
-
-                    let consumer = destination
-                        .cmd(&["recv", "-u", &destination.dataset])
-                        .stdin(producer.stdout.take().unwrap())
-                        .spawn()
-                        .unwrap();
-
-                    consumer.wait_with_output().unwrap();
-
-                    prev = path;
-                }
-
-                println!("Pruning origin markers.");
-                for marker in origin_markers {
-                    origin.destroy_snapshot(&marker.path);
-                }
-
-                println!("Pruning destination markers.");
-                for marker in destination_markers {
-                    destination.destroy_snapshot(&marker.path);
-                }
-
-                let snapshots_to_prune = destination_snapshots
-                    .into_iter()
-                    .filter(|snap| plan.remove.contains(&snap))
-                    .collect::<Vec<_>>();
-
-                println!("Pruning destination snapshots.");
-                for snapshot in snapshots_to_prune {
-                    println!("Removing {}.", snapshot.path);
-                    destination.destroy_snapshot(&snapshot.path);
-                }
-
-                println!("Done.");
-            } else {
-                setup_replication(&origin, &destination, &path);
+                prev = path;
             }
+
+            println!("Pruning origin markers.");
+            for marker in origin_markers {
+                origin.destroy_snapshot(&marker.path);
+            }
+
+            println!("Pruning destination markers.");
+            for marker in destination_markers {
+                println!("Pruning remote's marker {}", marker.path);
+                destination.destroy_snapshot(&marker.path);
+            }
+
+            let destination_snapshots = destination.list_snapshots();
+            let destination_plan = find_prunable(&now, &destination_spec, destination_snapshots);
+            for snapshot in destination_plan.remove {
+                println!("Pruning remote's snapshot {}", snapshot.path);
+                destination.destroy_snapshot(&snapshot.path);
+            }
+
+            println!("Done.");
         }
     }
 }
