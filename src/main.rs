@@ -1,7 +1,6 @@
 use chrono::{Datelike, Duration, DurationRound, TimeZone, Utc};
 use clap::Clap;
 use std::{
-    collections::HashSet,
     ops::Sub,
     process::{Command, Stdio},
 };
@@ -130,12 +129,38 @@ impl Remote {
             .collect()
     }
 
-    fn list_markers(&self, name: &str) -> Vec<Snapshot> {
-        let re = regex::Regex::new(r"^[a-z/]+@repl-").unwrap();
-        self.internal_list_snapshots()
-            .into_iter()
+    fn list_bookmarks(&self, name: &str) -> Vec<Snapshot> {
+        let out = match self.exec(&[
+            "list",
+            "-t",
+            "bookmark",
+            "-o",
+            "name,creation",
+            "-Hp",
+            &self.dataset,
+        ]) {
+            Ok(x) => x,
+            Err(e) => {
+                if e.contains("does not exist") {
+                    "".to_string()
+                } else {
+                    panic!("cmd err: {}", e);
+                }
+            }
+        };
+
+        let re = regex::Regex::new(r"^[a-z/]+#\d{4}-\d{2}-\d{2}T\d{4}-sync-").unwrap();
+
+        out.lines()
+            .map(|line| {
+                let parts = line.split('\t').collect::<Vec<_>>();
+                Snapshot {
+                    path: parts[0].to_string(),
+                    time: chrono::Utc.timestamp(parts[1].parse::<i64>().unwrap(), 0),
+                }
+            })
             .filter(|snap| {
-                re.is_match(&snap.path) && snap.path.contains(&format!("@repl-{}", name))
+                re.is_match(&snap.path) && snap.path.ends_with(&("-sync-".to_string() + name))
             })
             .collect()
     }
@@ -144,9 +169,20 @@ impl Remote {
         self.exec(&["snapshot", path]).unwrap();
     }
 
+    fn bookmark(&self, base: &str, mark: &str) {
+        self.exec(&["bookmark", base, mark]).unwrap();
+    }
+
     fn destroy_snapshot(&self, path: &str) {
         if !path.contains('@') {
             panic!("invalid path for snapshot");
+        }
+        self.exec(&["destroy", path]).unwrap();
+    }
+
+    fn destroy_bookmark(&self, path: &str) {
+        if !path.contains('#') {
+            panic!("invalid path for bookmark");
         }
         self.exec(&["destroy", path]).unwrap();
     }
@@ -246,14 +282,15 @@ fn find_prunable(
     out
 }
 
-fn setup_replication(origin: &Remote, destination: &Remote, path: &str) {
-    println!("Creating marker {}.", path);
-    origin.snapshot(&path);
+fn send_nonincremental(origin: &Remote, destination: &Remote, name: &str) {
+    let mut snapshots = origin.list_snapshots();
+    snapshots.sort_by(|a, b| a.time.cmp(&b.time));
+    let path = &snapshots.last().unwrap().path;
 
     println!("Sending...");
 
     let mut producer = origin
-        .cmd(&["send", "-w", &path])
+        .cmd(&["send", "-w", path])
         .stdout(Stdio::piped())
         .spawn()
         .unwrap();
@@ -265,6 +302,10 @@ fn setup_replication(origin: &Remote, destination: &Remote, path: &str) {
         .unwrap();
 
     consumer.wait_with_output().unwrap();
+
+    let bookmark = path.replace('@', "#") + &format!("-sync-{}", name);
+    println!("Creating bookmark {}.", bookmark);
+    origin.bookmark(&path, &bookmark);
 
     println!("Done.");
 }
@@ -330,13 +371,16 @@ fn main() {
             let origin = parse_remote(&cmd.location);
 
             let snapshots = origin.list_snapshots();
-            if let Some(last) = snapshots.last() {
-                if now.sub(last.time) > chrono::Duration::minutes(14) {
-                    let now_tag = now.format("%Y-%m-%dT%H%M");
-                    let path = format!("{}@{}", origin.dataset, now_tag);
-                    println!("Creating snapshot {}.", path);
-                    origin.snapshot(&path);
-                }
+            let should_snapshot = if let Some(last) = snapshots.last() { 
+                now.sub(last.time) > chrono::Duration::minutes(14)
+            } else {
+                true
+            };
+            if should_snapshot {
+                let now_tag = now.format("%Y-%m-%dT%H%M");
+                let path = format!("{}@{}", origin.dataset, now_tag);
+                println!("Creating snapshot {}.", path);
+                origin.snapshot(&path);
             }
 
             let spec = parse_spec(&cmd.keep);
@@ -354,30 +398,26 @@ fn main() {
             let origin = parse_remote(&cmd.from);
             let destination = parse_remote(&cmd.to);
 
-            let now = chrono::Utc::now();
-            let now_tag = now.format("%Y-%m-%dT%H%M%S");
-            let now_path = format!("{}@repl-{}-{}", origin.dataset, cmd.name, now_tag);
+            let mut origin_bookmarks = origin.list_bookmarks(&cmd.name);
+            origin_bookmarks.sort_by(|a, b| a.time.cmp(&b.time));
 
-            let mut origin_markers = origin.list_markers(&cmd.name);
-            origin_markers.sort_by(|a, b| a.time.cmp(&b.time));
-
-            let marker = match origin_markers.first() {
+            let bookmark = match origin_bookmarks.last() {
                 Some(x) => x,
                 None => {
-                    setup_replication(&origin, &destination, &now_path);
+                    send_nonincremental(&origin, &destination, &cmd.name);
                     return;
                 }
             };
 
+            println!("Using bookmark {}.", bookmark.path);
+
             let mut snapshots_to_send = {
-                let mut candidates = vec![marker.clone()];
-                let mut new_origin_snapshots = origin
+                let new_origin_snapshots = origin
                     .list_snapshots()
                     .into_iter()
-                    .filter(|x| x.time > marker.time)
+                    .filter(|x| x.time > bookmark.time)
                     .collect::<Vec<_>>();
-                candidates.append(&mut new_origin_snapshots);
-                find_prunable(&now, &destination_spec, candidates)
+                find_prunable(&now, &destination_spec, new_origin_snapshots)
                     .keep
                     .into_iter()
                     .filter(|x| is_normal_snapshot(&x.path))
@@ -391,46 +431,31 @@ fn main() {
                 return;
             }
 
-            let dest_markers = destination.list_markers(&cmd.name);
-            let dest_marker_tags = dest_markers
-                .iter()
-                .map(|snap| snap.path.split('@').nth(1).unwrap().to_string())
-                .collect::<HashSet<_>>();
-            let marker_tag = marker.path.split('@').nth(1).unwrap();
-            if !dest_marker_tags.contains(marker_tag) {
-                println!("Destination missing marker.");
-                setup_replication(&origin, &destination, &now_path);
-                return;
-            }
-
             let dest_snapshots = destination.list_snapshots();
-            for snapshot in dest_snapshots.iter().filter(|x| x.time > marker.time) {
+            for snapshot in dest_snapshots.iter().filter(|x| x.time > bookmark.time) {
                 println!("Destroying destination's {}.", snapshot.path);
                 destination.destroy_snapshot(&snapshot.path);
             }
 
-            println!("Creating marker {}.", now_path);
-            origin.snapshot(&now_path);
-
-            let mut send_paths = snapshots_to_send
+            let send_paths = snapshots_to_send
                 .into_iter()
                 .map(|x| x.path)
                 .collect::<Vec<_>>();
-            send_paths.push(now_path);
 
             println!("Sending:");
             for path in &send_paths {
                 println!("- {}", path);
             }
 
-            let destination_markers = destination.list_markers(&cmd.name);
-
-            let mut prev = marker.path.clone();
+            let mut first = true;
+            let mut prev = bookmark.path.clone();
             for path in send_paths {
                 println!("Sending {} -> {}.", prev, path);
 
+                let flags = if first { "-wi" } else { "-wI" };
+
                 let mut producer = origin
-                    .cmd(&["send", "-wI", &prev, &path])
+                    .cmd(&["send", flags, &prev, &path])
                     .stdout(Stdio::piped())
                     .spawn()
                     .unwrap();
@@ -453,18 +478,18 @@ fn main() {
                     return;
                 }
 
+                origin.bookmark(&path, &(path.replace('@', "#") + "-sync-" + &cmd.name));
+
                 prev = path;
+                first = false;
             }
 
-            println!("Pruning origin markers.");
-            for marker in origin_markers {
-                origin.destroy_snapshot(&marker.path);
-            }
-
-            println!("Pruning destination markers.");
-            for marker in destination_markers {
-                println!("Pruning remote's marker {}", marker.path);
-                destination.destroy_snapshot(&marker.path);
+            let mut origin_bookmarks = origin.list_bookmarks(&cmd.name);
+            origin_bookmarks.sort_by(|a,b| a.time.cmp(&b.time));
+            origin_bookmarks.pop(); // remove latest bookmark
+            for bookmark in origin_bookmarks {
+                println!("Pruning origin's bookmark {}", bookmark.path);
+                origin.destroy_bookmark(&bookmark.path);
             }
 
             let destination_snapshots = destination.list_snapshots();
